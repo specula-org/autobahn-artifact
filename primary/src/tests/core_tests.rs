@@ -87,6 +87,9 @@ async fn process_header() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
     // Send a header to the core.
@@ -178,6 +181,9 @@ async fn process_header_missing_parent() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
     let header_one = header();
@@ -260,6 +266,9 @@ async fn process_header_invalid_height() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
     // Send a header to the core.
@@ -345,6 +354,9 @@ async fn process_header_missing_payload() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
     // Send a header to the core.
@@ -428,6 +440,9 @@ async fn process_votes() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
@@ -537,6 +552,9 @@ async fn process_certificates() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
@@ -654,6 +672,9 @@ async fn process_prepare() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
@@ -784,6 +805,9 @@ async fn generate_confirm() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
@@ -931,6 +955,9 @@ async fn generate_commit() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
@@ -1133,6 +1160,9 @@ async fn generate_pipelined_prepare() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
@@ -1299,6 +1329,9 @@ async fn local_timeout_view() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
@@ -1387,6 +1420,9 @@ async fn sync_missing_proposals() {
         parameters.fast_path_timeout,
         parameters.use_ride_share,
         parameters.car_timeout,
+        false, // simulate_asynchrony
+        0,     // asynchrony_start
+        0,     // asynchrony_duration
     );
 
 
