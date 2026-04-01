@@ -3,10 +3,8 @@
 //! Emits NDJSON trace events compatible with Trace.tla.
 //! Activated by setting the `TLA_TRACE_FILE` environment variable.
 //!
-//! Usage (automatic in instrumented core.rs):
-//!   - On startup, `try_init()` checks `TLA_TRACE_FILE` env var
-//!   - If set, initializes the trace writer with the given path
-//!   - At each instrumentation point, `emit_*()` writes an NDJSON line
+//! Output format (flat, matching Trace.tla's logline access pattern):
+//!   {"tag":"consensus","event":"SendPrepare","node":"n1","slot":1,"view":1,"val":"v1","state":{...}}
 //!
 //! Thread safety: Uses OnceLock<Mutex<TraceWriter>>. All emit calls
 //! are serialized through the mutex.
@@ -15,6 +13,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,14 +25,15 @@ use crypto::PublicKey;
 
 static WRITER: OnceLock<Mutex<TraceWriter>> = OnceLock::new();
 static SERVER_MAP: OnceLock<Mutex<ServerMap>> = OnceLock::new();
+static FIRST_EVENT: AtomicBool = AtomicBool::new(true);
 
 struct TraceWriter {
     file: BufWriter<File>,
 }
 
 struct ServerMap {
-    /// Maps PublicKey bytes → TLA+ server name ("s1", "s2", ...)
-    map: HashMap<Vec<u8>, String>,
+    /// Maps PublicKey hex string → TLA+ server name ("n1", "n2", ...)
+    map: HashMap<String, String>,
     next_id: usize,
 }
 
@@ -48,6 +48,9 @@ pub fn try_init() {
         return;
     }
     if let Ok(path) = std::env::var("TLA_TRACE_FILE") {
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -61,6 +64,7 @@ pub fn try_init() {
             map: HashMap::new(),
             next_id: 1,
         }));
+        FIRST_EVENT.store(true, Ordering::SeqCst);
         eprintln!("[tla_trace] Tracing to: {}", path);
     }
 }
@@ -70,22 +74,29 @@ pub fn is_active() -> bool {
     WRITER.get().is_some()
 }
 
-/// Map a PublicKey to its TLA+ server name ("s1", "s2", ...).
+/// Map a PublicKey to its TLA+ server name ("n1", "n2", ...).
 /// Assigns names in order of first encounter.
 pub fn nid(pk: &PublicKey) -> String {
     if let Some(sm) = SERVER_MAP.get() {
         if let Ok(mut guard) = sm.lock() {
-            let key = pk.0.to_vec();
+            let key = pk_hex(pk);
             if let Some(name) = guard.map.get(&key) {
                 return name.clone();
             }
-            let name = format!("s{}", guard.next_id);
+            let name = format!("n{}", guard.next_id);
             guard.next_id += 1;
             guard.map.insert(key, name.clone());
             return name;
         }
     }
     format!("{:?}", pk)
+}
+
+/// Register all server public keys upfront so node_map is complete on the first event.
+pub fn register_servers(keys: &[PublicKey]) {
+    for pk in keys {
+        nid(pk);
+    }
 }
 
 /// Map a proposal value to an abstract TLA+ value name.
@@ -108,235 +119,124 @@ pub fn abstract_value(digest_bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Emit functions (one per spec action)
+// State snapshot builder
 // ---------------------------------------------------------------------------
 
-/// Emit a consensus state snapshot for the given node and slot.
-pub fn make_state(
-    slot: u64,
-    view: u64,
-    voted_prepare: u64,
-    voted_confirm: u64,
-    committed: &str,
-    high_qc_view: u64,
-    high_qc_value: &str,
-    high_prop_view: u64,
-    high_prop_value: &str,
-) -> Value {
+/// Build a state snapshot JSON object for the given slot.
+/// Field names match Trace.tla's ValidateNodeState access pattern.
+pub fn make_state(view: u64, committed: bool) -> Value {
     json!({
-        "slot": slot,
         "view": view,
-        "votedPrepare": voted_prepare,
-        "votedConfirm": voted_confirm,
-        "committed": committed,
-        "highQCView": high_qc_view,
-        "highQCValue": high_qc_value,
-        "highPropView": high_prop_view,
-        "highPropValue": high_prop_value,
+        "committed": if committed { "true" } else { "false" },
     })
 }
 
-/// Emit a generic trace event.
-pub fn emit(name: &str, nid_str: &str, state: Value, msg: Option<Value>) {
-    let mut event = json!({
-        "name": name,
-        "nid": nid_str,
-        "state": state,
-    });
-    if let Some(m) = msg {
-        event["msg"] = m;
-    }
-    let line = json!({
-        "tag": "trace",
-        "ts": now_ns(),
+/// Build a state snapshot with confirm_voted_value (for ReceiveConfirm events).
+pub fn make_state_with_confirm(view: u64, committed: bool, confirm_voted_value: &str) -> Value {
+    json!({
+        "view": view,
+        "committed": if committed { "true" } else { "false" },
+        "confirm_voted_value": confirm_voted_value,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Core emit function
+// ---------------------------------------------------------------------------
+
+/// Emit a trace event in the flat NDJSON format expected by Trace.tla.
+///
+/// Every line has: event, node, slot, view, state, ts.
+/// The value field is included when present (required by Trace.tla for most events).
+/// The first event also includes node_map.
+pub fn emit_event(
+    event: &str,
+    node: &str,
+    slot: u64,
+    view: u64,
+    value: Option<&str>,
+    state: Value,
+) {
+    let mut line = json!({
         "event": event,
+        "node": node,
+        "slot": slot,
+        "view": view,
+        "state": state,
+        "ts": now_ns().to_string(),
     });
+    if let Some(v) = value {
+        line["value"] = json!(v);
+    }
+    // Include node_map on the first event
+    if FIRST_EVENT.swap(false, Ordering::SeqCst) {
+        if let Some(sm) = SERVER_MAP.get() {
+            if let Ok(guard) = sm.lock() {
+                let node_map: serde_json::Map<String, Value> = guard
+                    .map
+                    .iter()
+                    .map(|(hex_pk, name)| (hex_pk.clone(), json!(name)))
+                    .collect();
+                line["node_map"] = Value::Object(node_map);
+            }
+        }
+    }
     write_line(&line);
 }
 
-/// Emit SendPrepare event.
-pub fn emit_send_prepare(
-    nid_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "SendPrepare",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-            "author": nid_str,
-        })),
-    );
+// ---------------------------------------------------------------------------
+// Convenience emit wrappers (match Trace.tla event names)
+// ---------------------------------------------------------------------------
+
+pub fn emit_send_prepare(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("SendPrepare", nid_str, slot, view, Some(value), state);
 }
 
-/// Emit ReceivePrepare event.
-pub fn emit_receive_prepare(
-    nid_str: &str,
-    author_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "ReceivePrepare",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-            "author": author_str,
-        })),
-    );
+pub fn emit_receive_prepare(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("ReceivePrepare", nid_str, slot, view, Some(value), state);
 }
 
-/// Emit SendConfirm event.
-pub fn emit_send_confirm(
-    nid_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "SendConfirm",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-        })),
-    );
+pub fn emit_send_confirm(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("SendConfirm", nid_str, slot, view, Some(value), state);
 }
 
-/// Emit ReceiveConfirm event.
-pub fn emit_receive_confirm(
-    nid_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "ReceiveConfirm",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-        })),
-    );
+pub fn emit_receive_confirm(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("ReceiveConfirm", nid_str, slot, view, Some(value), state);
 }
 
-/// Emit SendCommit event (slow path, from ConfirmQC).
-pub fn emit_send_commit(
-    nid_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "SendCommit",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-        })),
-    );
+pub fn emit_send_commit_slow(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("SendCommitSlow", nid_str, slot, view, Some(value), state);
 }
 
-/// Emit SendFastCommit event (fast path, from PrepareQC with N votes).
-pub fn emit_send_fast_commit(
-    nid_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "SendFastCommit",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-        })),
-    );
+pub fn emit_send_commit_fast(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("SendCommitFast", nid_str, slot, view, Some(value), state);
 }
 
-/// Emit ReceiveCommit event.
-pub fn emit_receive_commit(
-    nid_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "ReceiveCommit",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-        })),
-    );
+pub fn emit_receive_commit(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("ReceiveCommit", nid_str, slot, view, Some(value), state);
 }
 
-/// Emit SendTimeout event.
-pub fn emit_send_timeout(nid_str: &str, state: Value) {
-    emit("SendTimeout", nid_str, state, None);
+pub fn emit_send_timeout(nid_str: &str, slot: u64, view: u64, state: Value) {
+    emit_event("SendTimeout", nid_str, slot, view, None, state);
 }
 
-/// Emit AdvanceView event.
-pub fn emit_advance_view(nid_str: &str, slot: u64, prev_view: u64, state: Value) {
-    let mut s = state;
-    s["prevView"] = json!(prev_view);
-    emit("AdvanceView", nid_str, s, None);
+pub fn emit_advance_view(nid_str: &str, slot: u64, old_view: u64, state: Value) {
+    emit_event("AdvanceView", nid_str, slot, old_view, None, state);
 }
 
-/// Emit GeneratePrepareFromTC event.
-pub fn emit_generate_prepare_from_tc(
-    nid_str: &str,
-    slot: u64,
-    view: u64,
-    value: &str,
-    state: Value,
-) {
-    emit(
-        "GeneratePrepareFromTC",
-        nid_str,
-        state,
-        Some(json!({
-            "slot": slot,
-            "view": view,
-            "value": value,
-        })),
-    );
-}
-
-/// Emit EnterSlot event.
-pub fn emit_enter_slot(nid_str: &str, slot: u64, state: Value) {
-    emit("EnterSlot", nid_str, state, None);
+pub fn emit_generate_prepare_from_tc(nid_str: &str, slot: u64, view: u64, value: &str, state: Value) {
+    emit_event("GeneratePrepareFromTC", nid_str, slot, view, Some(value), state);
 }
 
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
+
+/// Get the hex-encoded string representation of a PublicKey.
+/// Used as the `node` field in trace events so that NodeMap can resolve it.
+pub fn pk_hex(pk: &PublicKey) -> String {
+    pk.0.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
 fn now_ns() -> u128 {
     SystemTime::now()

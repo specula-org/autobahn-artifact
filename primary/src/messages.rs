@@ -75,9 +75,9 @@ pub enum ConsensusType {
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CommitQC {
     pub slot: Slot,
-    view: View,
-    qc: QC, //ConfirmQC
-    proposals: HashMap<PublicKey, Proposal>,
+    pub view: View,
+    pub qc: QC, //ConfirmQC
+    pub proposals: HashMap<PublicKey, Proposal>,
 }
 
 impl CommitQC {

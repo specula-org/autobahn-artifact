@@ -7,6 +7,7 @@ use crate::error::{DagError, DagResult};
 use crate::leader::LeaderElector;
 use crate::messages::{
     Certificate, ConsensusMessage, Header, Proposal, Timeout, Vote, TC, ConsensusType, QC, verify_confirm, verify_commit, CommitQC, transform_commitQC, ConsensusRequest, ConsensusVote,
+    proposal_digest,
 };
 use crate::primary::{Height, PrimaryMessage, Slot, View};
 use crate::synchronizer::{Synchronizer, self};
@@ -39,6 +40,9 @@ use crate::tla_trace;
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
+#[cfg(test)]
+#[path = "tests/trace_test.rs"]
+pub mod trace_test;
 
 pub struct Core {
     /// The public key of this primary.
@@ -670,14 +674,15 @@ impl Core {
                             let mut new_proposals = proposals.clone(); 
                             new_proposals.insert(self.name, leader_tip_proposal);*/
                             
+                            let tla_val = if tla_trace::is_active() { tla_trace::abstract_value(&proposal_digest(current_instance).0) } else { String::new() };
                             let new_consensus_message = match qc_maker.try_fast {
                                 true => {
                                     debug!("taking fast path!");
-                                    // TLA+ trace: SendFastCommit
+                                    // TLA+ trace: SendCommitFast
                                     if tla_trace::is_active() {
                                         let nid_str = tla_trace::nid(&self.name);
                                         let state = self.tla_state(*slot);
-                                        tla_trace::emit_send_fast_commit(&nid_str, *slot, *view, "?", state);
+                                        tla_trace::emit_send_commit_fast(&nid_str, *slot, *view, &tla_val, state);
                                     }
                                     ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                     }, // Create Commit if we have FastPrepareQC
@@ -686,7 +691,7 @@ impl Core {
                                     if tla_trace::is_active() {
                                         let nid_str = tla_trace::nid(&self.name);
                                         let state = self.tla_state(*slot);
-                                        tla_trace::emit_send_confirm(&nid_str, *slot, *view, "?", state);
+                                        tla_trace::emit_send_confirm(&nid_str, *slot, *view, &tla_val, state);
                                     }
                                     ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                 },
@@ -704,11 +709,12 @@ impl Core {
                             debug!("Commit QC formed in slot {:?}", slot);
                             let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
-                            // TLA+ trace: SendCommit (from ConfirmQC)
+                            // TLA+ trace: SendCommitSlow (from ConfirmQC)
                             if tla_trace::is_active() {
                                 let nid_str = tla_trace::nid(&self.name);
+                                let val = tla_trace::abstract_value(&proposal_digest(current_instance).0);
                                 let state = self.tla_state(*slot);
-                                tla_trace::emit_send_commit(&nid_str, *slot, *view, "?", state);
+                                tla_trace::emit_send_commit_slow(&nid_str, *slot, *view, &val, state);
                             }
 
                             // Send this new instance to the proposer
@@ -851,17 +857,32 @@ impl Core {
                 //println!("QC formed");
             
                 match current_instance {
-                    ConsensusMessage::Prepare {slot, view, tc: _, qc_ticket: _, proposals,} 
+                    ConsensusMessage::Prepare {slot, view, tc: _, qc_ticket: _, proposals,}
                     => {
                         debug!("Prepare QC formed in slot {:?}", slot);
                         debug!("Prepare has slot: {}, view: {}, digest: {}", slot, view, current_instance.digest());
 
+                        let tla_val = if tla_trace::is_active() { tla_trace::abstract_value(&proposal_digest(current_instance).0) } else { String::new() };
                         let new_consensus_message = match qc_maker.try_fast {
                             true => {
                                 debug!("taking fast path!");
+                                // TLA+ trace: SendCommitFast (from FastPrepareQC)
+                                if tla_trace::is_active() {
+                                    let nid_str = tla_trace::nid(&self.name);
+                                    let state = self.tla_state(*slot);
+                                    tla_trace::emit_send_commit_fast(&nid_str, *slot, *view, &tla_val, state);
+                                }
                                 ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                 }, // Create Commit if we have FastPrepareQC
-                            false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
+                            false => {
+                                // TLA+ trace: SendConfirm
+                                if tla_trace::is_active() {
+                                    let nid_str = tla_trace::nid(&self.name);
+                                    let state = self.tla_state(*slot);
+                                    tla_trace::emit_send_confirm(&nid_str, *slot, *view, &tla_val, state);
+                                }
+                                ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
+                            },
                         };
                         //let new_consensus_message = ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: new_proposals,};
 
@@ -873,6 +894,14 @@ impl Core {
                         debug!("Commit QC formed in slot {:?}", slot);
                         let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
+                        // TLA+ trace: SendCommitSlow (from ConfirmQC)
+                        if tla_trace::is_active() {
+                            let nid_str = tla_trace::nid(&self.name);
+                            let val = tla_trace::abstract_value(&proposal_digest(current_instance).0);
+                            let state = self.tla_state(*slot);
+                            tla_trace::emit_send_commit_slow(&nid_str, *slot, *view, &val, state);
+                        }
+
                         // continue with next consensus phase
                         self.send_consensus_req(new_consensus_message).await?;
                     }
@@ -882,7 +911,7 @@ impl Core {
                 };
             }
         }
-         
+
         Ok(())
     }
 
@@ -949,24 +978,9 @@ impl Core {
 
         debug!("Send req for Consensus message {}", consensus_message);
 
-        // TLA+ trace: emit send events for direct-path messages
-        if tla_trace::is_active() {
-            let nid_str = tla_trace::nid(&self.name);
-            match &consensus_message {
-                ConsensusMessage::Prepare { slot, view, .. } => {
-                    let state = self.tla_state(*slot);
-                    tla_trace::emit_send_prepare(&nid_str, *slot, *view, "?", state);
-                },
-                ConsensusMessage::Confirm { slot, view, .. } => {
-                    let state = self.tla_state(*slot);
-                    tla_trace::emit_send_confirm(&nid_str, *slot, *view, "?", state);
-                },
-                ConsensusMessage::Commit { slot, view, .. } => {
-                    let state = self.tla_state(*slot);
-                    tla_trace::emit_send_commit(&nid_str, *slot, *view, "?", state);
-                },
-            }
-        }
+        // TLA+ trace: emit is handled at each call site of send_consensus_req to
+        // distinguish event types (SendPrepare, SendConfirm, SendCommitSlow, SendCommitFast,
+        // GeneratePrepareFromTC). No emit here to avoid double-emission.
 
         let consensus_req = ConsensusRequest::new(self.name, consensus_message, &mut self.signature_service).await;
 
@@ -1122,6 +1136,14 @@ impl Core {
                     // // NOTE: This log entry is used to compute performance.
                     // info!("Started slot {}", slot + 1);
                     // 
+
+                    // TLA+ trace: SendPrepare (new slot proposal)
+                    if tla_trace::is_active() {
+                        let nid_str = tla_trace::nid(&self.name);
+                        let val = self.tla_value(&new_prepare_instance);
+                        let state = self.tla_state(slot + 1);
+                        tla_trace::emit_send_prepare(&nid_str, slot + 1, 1, &val, state);
+                    }
 
                     if self.use_ride_share {
                         self.tx_info
@@ -1496,10 +1518,9 @@ impl Core {
                 // TLA+ trace: ReceivePrepare
                 if tla_trace::is_active() {
                     let nid_str = tla_trace::nid(&self.name);
-                    // Note: we don't have author from prepare_message directly in match,
-                    // use slot/view as identifying info
+                    let val = self.tla_value(prepare_message);
                     let state = self.tla_state(*slot);
-                    tla_trace::emit_receive_prepare(&nid_str, "?", *slot, *view, "?", state);
+                    tla_trace::emit_receive_prepare(&nid_str, *slot, *view, &val, state);
                 }
 
                 if self.use_fast_path {
@@ -1541,8 +1562,9 @@ impl Core {
                 self.voted_confirm_shadow.insert(*slot, *view);
                 if tla_trace::is_active() {
                     let nid_str = tla_trace::nid(&self.name);
-                    let state = self.tla_state(*slot);
-                    tla_trace::emit_receive_confirm(&nid_str, *slot, *view, "?", state);
+                    let val = self.tla_value(confirm_message);
+                    let state = self.tla_state_with_confirm(*slot, &val);
+                    tla_trace::emit_receive_confirm(&nid_str, *slot, *view, &val, state);
                 }
 
                 // Indicate that we vote for this instance's confirm message
@@ -1609,8 +1631,9 @@ impl Core {
                 // TLA+ trace: ReceiveCommit
                 if tla_trace::is_active() {
                     let nid_str = tla_trace::nid(&self.name);
+                    let val = self.tla_value(&commit_message);
                     let state = self.tla_state(*slot);
-                    tla_trace::emit_receive_commit(&nid_str, *slot, *view, "?", state);
+                    tla_trace::emit_receive_commit(&nid_str, *slot, *view, &val, state);
                 }
 
                 //self.begin_slot_from_commit(&commit_message).await.expect("Failed to start next consensus");
@@ -1824,7 +1847,7 @@ impl Core {
         if tla_trace::is_active() {
             let nid_str = tla_trace::nid(&self.name);
             let state = self.tla_state(slot);
-            tla_trace::emit_send_timeout(&nid_str, state);
+            tla_trace::emit_send_timeout(&nid_str, slot, view, state);
         }
 
         // Broadcast the timeout message.
@@ -1895,7 +1918,7 @@ impl Core {
             // Try to advance the view
             self.views.insert(timeout.slot, timeout.view + 1);
 
-            // TLA+ trace: AdvanceView
+            // TLA+ trace: AdvanceView (old_view = timeout.view)
             if tla_trace::is_active() {
                 let nid_str = tla_trace::nid(&self.name);
                 let state = self.tla_state(timeout.slot);
@@ -1964,8 +1987,9 @@ impl Core {
             // TLA+ trace: GeneratePrepareFromTC
             if tla_trace::is_active() {
                 let nid_str = tla_trace::nid(&self.name);
+                let val = self.tla_value(&prepare_message);
                 let state = self.tla_state(tc.slot);
-                tla_trace::emit_generate_prepare_from_tc(&nid_str, tc.slot, tc.view + 1, "?", state);
+                tla_trace::emit_generate_prepare_from_tc(&nid_str, tc.slot, tc.view + 1, &val, state);
             }
 
             if self.use_ride_share {
@@ -2112,25 +2136,32 @@ impl Core {
 
     // Main loop listening to incoming messages.
     /// TLA+ trace: create a state snapshot for the given slot.
+    /// Fields match Trace.tla's ValidateNodeState: view, committed ("true"/"false").
     fn tla_state(&self, slot: Slot) -> serde_json::Value {
         let view = self.views.get(&slot).copied().unwrap_or(0);
-        let voted_prepare = if self.last_voted_consensus.contains(&(slot, view)) { view } else { 0 };
-        let voted_confirm = self.voted_confirm_shadow.get(&slot).copied().unwrap_or(0);
-        let committed = if self.committed_slots.contains_key(&slot) { "committed" } else { "nil" };
-        let (hqc_view, hqc_val) = match self.high_qcs.get(&slot) {
-            Some(ConsensusMessage::Confirm { view, .. }) => (*view, "confirmed"),
-            _ => (0, "nil"),
-        };
-        let (hp_view, hp_val) = match self.high_proposals.get(&slot) {
-            Some(ConsensusMessage::Prepare { view, .. }) => (*view, "prepared"),
-            _ => (0, "nil"),
-        };
-        tla_trace::make_state(slot, view, voted_prepare, voted_confirm, committed, hqc_view, hqc_val, hp_view, hp_val)
+        let committed = self.committed_slots.contains_key(&slot);
+        tla_trace::make_state(view, committed)
+    }
+
+    /// TLA+ trace: state snapshot with confirm_voted_value for ReceiveConfirm events.
+    fn tla_state_with_confirm(&self, slot: Slot, confirm_value: &str) -> serde_json::Value {
+        let view = self.views.get(&slot).copied().unwrap_or(0);
+        let committed = self.committed_slots.contains_key(&slot);
+        tla_trace::make_state_with_confirm(view, committed, confirm_value)
+    }
+
+    /// TLA+ trace: compute abstract value from a consensus message's proposals.
+    fn tla_value(&self, msg: &ConsensusMessage) -> String {
+        tla_trace::abstract_value(&proposal_digest(msg).0)
     }
 
     pub async fn run(&mut self) {
         // Initialize TLA+ tracing (no-op if TLA_TRACE_FILE not set)
         tla_trace::try_init();
+        if tla_trace::is_active() {
+            let server_keys: Vec<PublicKey> = self.committee.authorities.keys().cloned().collect();
+            tla_trace::register_servers(&server_keys);
+        }
 
         //Simulate asynchrony duration:
         /*if self.simulate_asynchrony {
@@ -2270,6 +2301,15 @@ impl Core {
                                 _ => false,
                             };
                             if still_relevant { //try sending it now.
+                                // TLA+ trace: SendPrepare (delayed async replay)
+                                if tla_trace::is_active() {
+                                    if let ConsensusMessage::Prepare { slot: ps, view: pv, .. } = &last_prop {
+                                        let nid_str = tla_trace::nid(&self.name);
+                                        let val = self.tla_value(&last_prop);
+                                        let state = self.tla_state(*ps);
+                                        tla_trace::emit_send_prepare(&nid_str, *ps, *pv, &val, state);
+                                    }
+                                }
                                 let _ = self.send_consensus_req(last_prop).await;
                             }
                             self.async_delayed_prepare = None;
