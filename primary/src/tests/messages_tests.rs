@@ -374,3 +374,81 @@ fn test_da13_qc_partialeq_always_false() {
     println!("DA-13 CONFIRMED: QC PartialEq always returns false, \
               even for identical QCs");
 }
+
+// BUG-03 Reproduction (message-level): Confirm Double-Vote via verify_confirm
+//
+// verify_confirm() accepts two Confirm messages with different proposals but
+// same (slot, view, QC) because proposal_digest is commented out (BUG-01).
+// Combined with the missing last_voted_consensus check in is_valid()
+// (core.rs:1235-1246), a node will vote for both, violating ConfirmUniqueness.
+#[test]
+fn test_bug03_confirm_double_vote_verify() {
+    use crate::common::{keys, committee};
+    use ed25519_dalek::Digest as _;
+    use std::convert::TryInto;
+
+    let keys = keys();
+    let committee = committee();
+
+    let slot: u64 = 1;
+    let view: u64 = 1;
+
+    // Build prepare_id = hash(slot, view, 0) — same as verify_confirm reconstructs
+    let prepare_id = {
+        let mut h = Sha512::new();
+        h.update(slot.to_le_bytes());
+        h.update(view.to_le_bytes());
+        h.update((0u8).to_le_bytes());
+        Digest(h.finalize().as_slice()[..32].try_into().unwrap())
+    };
+
+    // Build a valid PrepareQC: 3-of-4 signatures on prepare_id
+    let qc_votes: Vec<(PublicKey, Signature)> = keys.iter().take(3)
+        .map(|(pk, sk)| (*pk, Signature::new(&prepare_id, sk)))
+        .collect();
+    let prepare_qc = QC { id: prepare_id, votes: qc_votes };
+
+    // Two different proposal sets
+    let proposals_v1: HashMap<PublicKey, Proposal> = {
+        let mut m = HashMap::new();
+        m.insert(keys[0].0, Proposal { header_digest: Digest([1u8; 32]), height: 1 });
+        m
+    };
+    let proposals_v2: HashMap<PublicKey, Proposal> = {
+        let mut m = HashMap::new();
+        m.insert(keys[0].0, Proposal { header_digest: Digest([2u8; 32]), height: 1 });
+        m
+    };
+
+    // Two Confirm messages: same (slot, view, QC), different proposals
+    let confirm_v1 = ConsensusMessage::Confirm {
+        slot, view, qc: prepare_qc.clone(), proposals: proposals_v1,
+    };
+    let confirm_v2 = ConsensusMessage::Confirm {
+        slot, view, qc: prepare_qc.clone(), proposals: proposals_v2,
+    };
+
+    // Sanity: digests are identical (BUG-01 prerequisite)
+    assert_eq!(confirm_v1.digest(), confirm_v2.digest(),
+        "Precondition: Confirm digests must match due to BUG-01");
+
+    // BUG-03: verify_confirm passes for BOTH — no proposal binding
+    let pass_v1 = verify_confirm(&confirm_v1, &committee);
+    let pass_v2 = verify_confirm(&confirm_v2, &committee);
+
+    if !pass_v1 {
+        std::panic!("verify_confirm(v1) should pass");
+    }
+    if !pass_v2 {
+        std::panic!("BUG-03: verify_confirm(v2) should also pass (demonstrating the bug)");
+    }
+
+    // Both pass verification. The is_valid() Confirm branch (core.rs:1235-1246)
+    // only checks curr_view <= view and verify_confirm — NO last_voted_consensus
+    // check. So a node will vote for both, creating two ConfirmVotes for the
+    // same (slot, view) with different proposal values.
+    println!("BUG-03 CONFIRMED: verify_confirm accepts two Confirm messages with \
+              different proposals for (slot={}, view={}). Combined with missing \
+              last_voted_consensus check in is_valid() Confirm branch, a node \
+              will double-vote.", slot, view);
+}

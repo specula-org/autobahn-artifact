@@ -1857,5 +1857,432 @@ async fn process_special_certificate() {
     let stored = store.read(cert.digest().to_vec()).await.unwrap();
     let serialized = bincode::serialize(&cert).unwrap();
     assert_eq!(stored, Some(serialized));
-    
+
 }*/
+
+/// Bug AUTOBAHN-MC-001 Reproduction: Multi-View Voting (Agreement Violation)
+///
+/// Demonstrates that a node can vote for Prepare messages in BOTH view 1 and
+/// view 2 for the same slot.  This is the root cause of the agreement violation
+/// found by TLC model checking: if all N nodes vote in both views, two
+/// conflicting fast PrepareQCs form, producing two Commit messages with
+/// different values for the same slot.
+///
+/// Reproduction level: Level 2 (state injection via ConsensusRequest messages
+/// through the Core's normal channel interface).
+#[tokio::test]
+#[serial]
+async fn bug1_multi_view_voting() {
+    let mut all_keys = keys();
+    // We need to know the public keys but also pass ownership of one secret.
+    // keys() returns [(pk0,sk0), (pk1,sk1), (pk2,sk2), (pk3,sk3)].
+    // We'll use keys[2] as Core identity.
+    let pk0 = all_keys[0].0;
+    let pk1 = all_keys[1].0;
+    let pk3 = all_keys[3].0;
+    let pk2 = all_keys[2].0;
+    let name = pk2;
+
+    // Build fresh key sets for signing (keys() is deterministic).
+    let sign_keys = keys(); // fresh copy for signatures
+
+    // Core needs ownership of its secret key.
+    let secret = keys().into_iter().nth(2).unwrap().1;
+
+    // Use a dedicated port range to avoid collisions with other tests.
+    let committee = committee_with_base_port(17_000);
+
+    // --- channels (large buffers to avoid blocking) ---
+    let (tx_sync_headers, _rx_sync_headers) = channel(100);
+    let (tx_sync_certificates, _rx_sync_certificates) = channel(100);
+    let (tx_primary_messages, rx_primary_messages) = channel(100);
+    let (_tx_headers_loopback, rx_headers_loopback) = channel(100);
+    let (_tx_headers, rx_headers) = channel(100);
+    let (tx_parents, _rx_parents) = channel(100);
+    let (tx_committer, _rx_committer) = channel(100);
+    let (_tx_request_header_sync, rx_request_header_sync) = channel(100);
+    let (tx_info, _rx_info) = channel(100);
+    let (_tx_hwi, rx_header_waiter_instances) = channel(100);
+
+    let path = ".db_test_bug1_multi_view";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+
+    let synchronizer = Synchronizer::new(
+        name, &committee, store.clone(), tx_sync_headers, tx_sync_certificates,
+    );
+    let leader_elector = LeaderElector::new(committee.clone());
+
+    // Spawn Core: k=1 (avoids slot arithmetic underflow), timeout 60 s,
+    // fast path ON.
+    Core::spawn(
+        name,
+        committee.clone(),
+        store.clone(),
+        synchronizer,
+        SignatureService::new(secret),
+        Arc::new(AtomicU64::new(0)),
+        50,  // gc_depth
+        rx_primary_messages,
+        rx_headers_loopback,
+        rx_header_waiter_instances,
+        rx_headers,
+        tx_committer,
+        tx_parents,
+        rx_request_header_sync,
+        tx_info,
+        leader_elector,
+        60_000, // timeout_delay – long enough to never fire during the test
+        true,   // use_optimistic_tips
+        true,   // use_parallel_proposals
+        1,      // k
+        true,   // use_fast_path
+        500,    // fast_path_timeout
+        false,  // use_ride_share
+        500,    // car_timeout
+        false, 0, 0, // simulate_asynchrony off
+    );
+
+    // Let the Core's event-loop start.
+    sleep(Duration::from_millis(200)).await;
+
+    // ── Step 1: Prepare(slot=1, view=1) via ConsensusRequest ──────────
+    let genesis_proposals = Header::genesis_proposals(&committee);
+    let prepare_v1 = ConsensusMessage::Prepare {
+        slot: 1, view: 1, tc: None, qc_ticket: None,
+        proposals: genesis_proposals.clone(),
+    };
+
+    let req_v1 = ConsensusRequest {
+        author: pk3,
+        message: prepare_v1.clone(),
+        sig: Signature::new(&prepare_v1.digest(), &sign_keys[3].1),
+    };
+
+    // Listener at keys[3]'s address – will capture the ConsensusVote.
+    let addr_3 = committee.primary(&pk3).unwrap().primary_to_primary;
+    let handle_v1 = listener(addr_3);
+
+    tx_primary_messages
+        .send(PrimaryMessage::ConsensusRequest(req_v1))
+        .await
+        .unwrap();
+
+    let received_v1 = handle_v1.await.unwrap();
+    let vote_v1: PrimaryMessage = bincode::deserialize(&received_v1).unwrap();
+
+    let digest_v1 = match &vote_v1 {
+        PrimaryMessage::ConsensusVote(cv) => {
+            println!(
+                "VOTE 1: Node {} voted for Prepare(slot=1, view=1), digest={}",
+                cv.author, cv.digest
+            );
+            assert_eq!(cv.slot, 1);
+            assert_eq!(cv.digest, prepare_v1.digest());
+            cv.digest.clone()
+        }
+        other => panic!("Expected ConsensusVote for view 1, got: {:?}", other),
+    };
+
+    // ── Step 2: Send 3 Timeouts → TC forms → view advances to 2 ──────
+    let t0 = Timeout::new_from_key(None, None, 1, 1, pk0, &sign_keys[0].1);
+    let t1 = Timeout::new_from_key(None, None, 1, 1, pk1, &sign_keys[1].1);
+    let t3 = Timeout::new_from_key(None, None, 1, 1, pk3, &sign_keys[3].1);
+
+    tx_primary_messages.send(PrimaryMessage::Timeout(t0.clone())).await.unwrap();
+    tx_primary_messages.send(PrimaryMessage::Timeout(t1.clone())).await.unwrap();
+    tx_primary_messages.send(PrimaryMessage::Timeout(t3.clone())).await.unwrap();
+
+    // Give Core time to form TC and advance view.
+    sleep(Duration::from_millis(500)).await;
+
+    // ── Step 3: Prepare(slot=1, view=2) via ConsensusRequest ──────────
+    let tc = TC::new(&committee, 1, 1, vec![t0, t1, t3]);
+    let prepare_v2 = ConsensusMessage::Prepare {
+        slot: 1, view: 2, tc: Some(tc), qc_ticket: None,
+        proposals: genesis_proposals.clone(),
+    };
+
+    let req_v2 = ConsensusRequest {
+        author: pk0,
+        message: prepare_v2.clone(),
+        sig: Signature::new(&prepare_v2.digest(), &sign_keys[0].1),
+    };
+
+    let addr_0 = committee.primary(&pk0).unwrap().primary_to_primary;
+    let handle_v2 = listener(addr_0);
+
+    tx_primary_messages
+        .send(PrimaryMessage::ConsensusRequest(req_v2))
+        .await
+        .unwrap();
+
+    let received_v2 = handle_v2.await.unwrap();
+    let vote_v2: PrimaryMessage = bincode::deserialize(&received_v2).unwrap();
+
+    let digest_v2 = match &vote_v2 {
+        PrimaryMessage::ConsensusVote(cv) => {
+            println!(
+                "VOTE 2: Node {} voted for Prepare(slot=1, view=2), digest={}",
+                cv.author, cv.digest
+            );
+            assert_eq!(cv.slot, 1);
+            assert_eq!(cv.digest, prepare_v2.digest());
+            cv.digest.clone()
+        }
+        other => panic!("Expected ConsensusVote for view 2, got: {:?}", other),
+    };
+
+    // ── Verification ──────────────────────────────────────────────────
+    assert_ne!(
+        digest_v1, digest_v2,
+        "Digests must differ (same slot, different views/proposals)"
+    );
+
+    println!();
+    println!("=== BUG AUTOBAHN-MC-001 CONFIRMED ===");
+    println!("Node voted for BOTH Prepare(slot=1, view=1) AND Prepare(slot=1, view=2).");
+    println!("With all N nodes behaving identically, two fast PrepareQCs form,");
+    println!("producing conflicting Commit messages → Agreement violation.");
+
+    let _ = fs::remove_dir_all(path);
+}
+
+/// BUG-03 Reproduction (Core level): Missing Confirm Double-Vote Protection
+///
+/// The is_valid() Confirm branch (core.rs:1235-1246) does NOT check
+/// last_voted_consensus, unlike the Prepare branch. A node processes and
+/// votes for two Confirm ConsensusRequests for the same (slot, view),
+/// demonstrating the missing deduplication.
+///
+/// Uses genesis proposals so the synchronizer can resolve them.
+///
+/// Reproduction level: Level 2 (state injection via ConsensusRequest).
+#[tokio::test]
+#[serial]
+async fn bug3_confirm_double_vote() {
+    use ed25519_dalek::Digest as _;
+    use std::convert::TryInto;
+
+    let all_keys = keys();
+    let pk0 = all_keys[0].0;
+    let pk2 = all_keys[2].0;
+    let pk3 = all_keys[3].0;
+    let name = pk2;
+
+    let sign_keys = keys();
+    let secret = keys().into_iter().nth(2).unwrap().1;
+    let committee = committee_with_base_port(25_000);
+
+    let (tx_sync_headers, _rx_sync_h) = channel(100);
+    let (tx_sync_certs, _rx_sync_c) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
+    let (_, rx_headers_loopback) = channel(100);
+    let (_, rx_headers) = channel(100);
+    let (tx_parents, _rx_parents) = channel(100);
+    let (tx_committer, _rx_committer) = channel(100);
+    let (_, rx_request) = channel(100);
+    let (tx_info, _rx_info) = channel(100);
+    let (_, rx_hwi) = channel(100);
+
+    let path = ".db_test_bug3_confirm_double_vote";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    let synchronizer = Synchronizer::new(
+        name, &committee, store.clone(), tx_sync_headers, tx_sync_certs,
+    );
+    let leader = LeaderElector::new(committee.clone());
+
+    Core::spawn(
+        name, committee.clone(), store.clone(), synchronizer,
+        SignatureService::new(secret),
+        Arc::new(AtomicU64::new(0)),
+        50, rx_primary, rx_headers_loopback, rx_hwi, rx_headers,
+        tx_committer, tx_parents, rx_request, tx_info, leader,
+        60_000, true, true, 1, true, 500, false, 500, false, 0, 0,
+    );
+
+    sleep(Duration::from_millis(200)).await;
+
+    let slot: u64 = 1;
+    let view: u64 = 1;
+    let genesis_proposals = Header::genesis_proposals(&committee);
+
+    // Build prepare_id = hash(slot, view, 0) — proposal_digest omitted (BUG-01)
+    let prepare_id = {
+        let mut h = ed25519_dalek::Sha512::new();
+        h.update(slot.to_le_bytes());
+        h.update(view.to_le_bytes());
+        h.update((0u8).to_le_bytes());
+        Digest(h.finalize().as_slice()[..32].try_into().unwrap())
+    };
+
+    // Build PrepareQC with 3-of-4 signatures
+    let qc_votes: Vec<(PublicKey, Signature)> = sign_keys.iter().take(3)
+        .map(|(pk, sk)| (*pk, Signature::new(&prepare_id, sk)))
+        .collect();
+    let prepare_qc = QC { id: prepare_id, votes: qc_votes };
+
+    // Build Confirm using genesis proposals (resolvable by synchronizer)
+    let confirm = ConsensusMessage::Confirm {
+        slot, view, qc: prepare_qc, proposals: genesis_proposals,
+    };
+
+    // --- Send first Confirm from pk3 ---
+    let req1 = ConsensusRequest {
+        author: pk3,
+        message: confirm.clone(),
+        sig: Signature::new(&confirm.digest(), &sign_keys[3].1),
+    };
+    let addr_3 = committee.primary(&pk3).unwrap().primary_to_primary;
+    let handle1 = listener(addr_3);
+
+    tx_primary.send(PrimaryMessage::ConsensusRequest(req1)).await.unwrap();
+
+    let data1 = handle1.await.unwrap();
+    match bincode::deserialize::<PrimaryMessage>(&data1).unwrap() {
+        PrimaryMessage::ConsensusVote(cv) => {
+            println!("VOTE 1: ConfirmVote(slot={}, digest={})", cv.slot, cv.digest);
+            assert_eq!(cv.slot, 1);
+        }
+        other => panic!("Expected ConsensusVote, got: {:?}", other),
+    };
+
+    // --- Send SAME Confirm from pk0 (second vote) ---
+    // BUG-03: is_valid() Confirm branch has no last_voted_consensus check,
+    // so the node votes again for the same (slot, view).
+    let req2 = ConsensusRequest {
+        author: pk0,
+        message: confirm.clone(),
+        sig: Signature::new(&confirm.digest(), &sign_keys[0].1),
+    };
+    let addr_0 = committee.primary(&pk0).unwrap().primary_to_primary;
+    let handle2 = listener(addr_0);
+
+    tx_primary.send(PrimaryMessage::ConsensusRequest(req2)).await.unwrap();
+
+    let data2 = handle2.await.unwrap();
+    match bincode::deserialize::<PrimaryMessage>(&data2).unwrap() {
+        PrimaryMessage::ConsensusVote(cv) => {
+            println!("VOTE 2: ConfirmVote(slot={}, digest={})", cv.slot, cv.digest);
+            assert_eq!(cv.slot, 1);
+        }
+        other => panic!("Expected ConsensusVote (second), got: {:?}", other),
+    };
+
+    println!();
+    println!("=== BUG-03 CONFIRMED ===");
+    println!("Node voted TWICE for Confirm(slot=1, view=1) — no deduplication.");
+    println!("With different proposals (via BUG-01), this produces conflicting ConfirmQCs.");
+
+    let _ = fs::remove_dir_all(path);
+}
+
+/// BUG-04 Reproduction: View Advancement Side-Effect on Rejected Messages
+///
+/// The is_valid() Prepare branch (core.rs:1226-1229) advances the node's
+/// local view BEFORE checking ticket_valid and last_voted_consensus.
+/// A rejected Prepare for a higher view corrupts the node's view, preventing
+/// it from participating in legitimate lower views.
+///
+/// Reproduction level: Level 2 (state injection via ConsensusRequest).
+#[tokio::test]
+#[serial]
+async fn bug4_view_advance_side_effect() {
+    let all_keys = keys();
+    let pk0 = all_keys[0].0;
+    let pk2 = all_keys[2].0;
+    let pk3 = all_keys[3].0;
+    let name = pk2;
+
+    let sign_keys = keys();
+    let secret = keys().into_iter().nth(2).unwrap().1;
+    let committee = committee_with_base_port(26_000);
+
+    let (tx_sync_headers, _rx_sync_h) = channel(100);
+    let (tx_sync_certs, _rx_sync_c) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
+    let (_, rx_headers_loopback) = channel(100);
+    let (_, rx_headers) = channel(100);
+    let (tx_parents, _rx_parents) = channel(100);
+    let (tx_committer, _rx_committer) = channel(100);
+    let (_, rx_request) = channel(100);
+    let (tx_info, _rx_info) = channel(100);
+    let (_, rx_hwi) = channel(100);
+
+    let path = ".db_test_bug4_view_advance";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    let synchronizer = Synchronizer::new(
+        name, &committee, store.clone(), tx_sync_headers, tx_sync_certs,
+    );
+    let leader = LeaderElector::new(committee.clone());
+
+    Core::spawn(
+        name, committee.clone(), store.clone(), synchronizer,
+        SignatureService::new(secret),
+        Arc::new(AtomicU64::new(0)),
+        50, rx_primary, rx_headers_loopback, rx_hwi, rx_headers,
+        tx_committer, tx_parents, rx_request, tx_info, leader,
+        60_000, true, true, 1, true, 500, false, 500, false, 0, 0,
+    );
+
+    sleep(Duration::from_millis(200)).await;
+
+    let genesis_proposals = Header::genesis_proposals(&committee);
+
+    // Step 1: Send INVALID Prepare(slot=1, view=3, tc=None).
+    // tc=None means ticket_valid = (view == 1) = false for view=3.
+    // But the view is advanced to 3 as a SIDE-EFFECT before rejection.
+    let invalid_prepare = ConsensusMessage::Prepare {
+        slot: 1, view: 3, tc: None, qc_ticket: None,
+        proposals: genesis_proposals.clone(),
+    };
+    let req_invalid = ConsensusRequest {
+        author: pk3,
+        message: invalid_prepare.clone(),
+        sig: Signature::new(&invalid_prepare.digest(), &sign_keys[3].1),
+    };
+
+    tx_primary.send(PrimaryMessage::ConsensusRequest(req_invalid)).await.unwrap();
+    sleep(Duration::from_millis(300)).await;
+    println!("Step 1: Sent INVALID Prepare(slot=1, view=3, tc=None) — rejected.");
+
+    // Step 2: Send VALID Prepare(slot=1, view=1, tc=None).
+    // This SHOULD succeed (view 1 with tc=None is valid).
+    // BUG-04: It is REJECTED because views[1] was corrupted to 3.
+    let valid_prepare = ConsensusMessage::Prepare {
+        slot: 1, view: 1, tc: None, qc_ticket: None,
+        proposals: genesis_proposals.clone(),
+    };
+    let req_valid = ConsensusRequest {
+        author: pk0,
+        message: valid_prepare.clone(),
+        sig: Signature::new(&valid_prepare.digest(), &sign_keys[0].1),
+    };
+
+    let addr_0 = committee.primary(&pk0).unwrap().primary_to_primary;
+    let handle = listener(addr_0);
+
+    tx_primary.send(PrimaryMessage::ConsensusRequest(req_valid)).await.unwrap();
+
+    // If bug exists, no vote is sent — the listener times out.
+    let result = tokio::time::timeout(Duration::from_millis(2000), handle).await;
+
+    match result {
+        Ok(Ok(data)) => {
+            let msg: PrimaryMessage = bincode::deserialize(&data).unwrap();
+            panic!("BUG-04 not triggered: node voted despite view corruption. Got: {:?}", msg);
+        }
+        Ok(Err(e)) => panic!("Listener error: {:?}", e),
+        Err(_timeout) => {
+            println!("Step 2: VALID Prepare(slot=1, view=1) — NO vote received (2s timeout).");
+            println!();
+            println!("=== BUG-04 CONFIRMED ===");
+            println!("Invalid Prepare(view=3) advanced views[1] from 0 to 3 as side-effect.");
+            println!("Valid Prepare(view=1) rejected because views[1]=3 != 1.");
+        }
+    }
+
+    let _ = fs::remove_dir_all(path);
+}
